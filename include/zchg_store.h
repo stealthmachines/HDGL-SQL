@@ -1,47 +1,49 @@
 /*
- * zchg_store.h  —  HDGL-sql: Strand-Native Persistent Store
+ * zchg_store.h  —  HDGL-sql v0.2: Strand-Native Persistent Store
  *
- * This is not a wrapper around SQLite.
- * SQLite was the inspiration; HDGL-sql is the evolution.
+ * v0.2 scaling additions
+ * ──────────────────────
+ * • Arbitrary strand count: configurable at open time (8, 16, 32, 64, 128,
+ *   256 …). More strands = finer key distribution + better I/O parallelism.
+ *   strand_count must be a power of 2. Default is 8 (backward-compatible).
+ *   Strands 0-7 keep geometric names; strands 8+ use strand_N.hdgl.
  *
- * Architecture
- * ────────────
- * • 8 append-only binary strand files on disk, one per geometric strand:
- *       strand_0_point.hdgl  …  strand_7_octacube.hdgl
+ * • Dynamic/growable in-memory index: no fixed 4096-slot cap. The index
+ *   starts at index_cap_hint (default 4096) and doubles automatically when
+ *   the load factor exceeds ZCHG_STORE_LOAD_FACTOR_REHASH (75%). Supports
+ *   tens of millions of live records on a single node before any OOM risk.
  *
- * • Every record on disk is a zchg_frame_t — the same binary frame type
- *   used for transport, gossip, and fileswap.  Storage and network speak
- *   the same language.
+ * • Shard-aware routing: optional shard_id / shard_count for multi-node
+ *   deployments. Each node opens its slice of the key space. put() returns
+ *   ZCHG_ERR_WRONG_SHARD (-2) for keys that belong to another shard.
+ *   zchg_store_shard_of(key, shard_count) lets callers pre-route.
+ *   shard_count=1 disables sharding (all keys accepted).
  *
- * • Addressing is phi-tau geometric, not integer.  The phi-tau hash of the
- *   logical key (zchg_compute_phi_tau) determines both which strand file the
- *   record lives in AND its unique address within the lattice.
- *   phi_addr is stored in the frame header's authority_ep + source_ip fields
- *   (low 32 / high 32 bits respectively).
+ * • Write buffers are per-store (not a static global), so multiple
+ *   zchg_store_t instances in the same process are fully independent.
  *
- * • authority_w is an analog EMA signal, not a timestamp.  It rises toward
- *   1.0 as a record is written and decays on cold records.  It is stored in
- *   the frame's reserved field as a 24.8 fixed-point integer.
+ * v0.1 compatibility
+ * ──────────────────
+ * zchg_store_open() still works unchanged — it calls zchg_store_open_ex()
+ * with defaults (strand_count=8, index_cap=4096, shard_id=0, shard_count=1).
+ * v0.2 can open v0.1 store directories as-is.
  *
- * • All frames are HMAC-SHA256 signed (same key as the cluster secret).
- *   A frame whose HMAC fails verification during boot-scan is skipped —
- *   the log self-heals from prior good frames.
- *
- * • Records are append-only.  Overwrites append a new frame with updated
- *   payload and EMA weight; history is preserved in the strand file.
- *   On startup the store scans each strand file sequentially, EMA-reducing
- *   all frames per phi_addr into an in-memory lattice index.
+ * Architecture (unchanged from v0.1)
+ * ────────────────────────────────────
+ * • Append-only binary strand files, one per strand.
+ * • Every record is a zchg_frame_t (HMAC-SHA256 signed).
+ * • Addressing is phi-tau geometric; strand = phi_addr & (strand_count-1).
+ * • authority_w is an analog EMA signal stored as 24.8 fixed-point.
+ * • Boot-scan rebuilds the in-memory index from on-disk frames.
  *
  * Strand file layout (per file)
  * ─────────────────────────────
- *   [sizeof(zchg_frame_header_t) bytes header][payload_len bytes payload]
- *   [sizeof(zchg_frame_header_t) bytes header][payload_len bytes payload]
- *   …  (never overwritten, append-only)
+ *   [zchg_frame_header_t][payload_len bytes payload]  (repeat, append-only)
  *
- * Payload encoding inside each frame
- * ────────────────────────────────────
+ * Payload encoding
+ * ────────────────
  *   [uint8_t type_len][type_len bytes record_type]
- *   [uint8_t ref_len] [ref_len bytes lattice_ref hex addr, or 0 if root]
+ *   [uint8_t ref_len] [ref_len bytes lattice_ref hex, or 0 if root]
  *   [remaining bytes: raw JSON payload]
  */
 
@@ -60,45 +62,49 @@ extern "C" {
  * Constants
  * ============================================================================ */
 
-/* New frame type for store records */
-#define ZCHG_FRAME_STORE            0x08
+/* Frame type for store records */
+#define ZCHG_FRAME_STORE                0x08
 
-/* Strand file names (lowercase to match STRAND_NAMES) */
-#define ZCHG_STORE_FILE_0           "strand_0_point.hdgl"
-#define ZCHG_STORE_FILE_1           "strand_1_line.hdgl"
-#define ZCHG_STORE_FILE_2           "strand_2_triangle.hdgl"
-#define ZCHG_STORE_FILE_3           "strand_3_tetrahedron.hdgl"
-#define ZCHG_STORE_FILE_4           "strand_4_pentachoron.hdgl"
-#define ZCHG_STORE_FILE_5           "strand_5_hexacross.hdgl"
-#define ZCHG_STORE_FILE_6           "strand_6_heptacube.hdgl"
-#define ZCHG_STORE_FILE_7           "strand_7_octacube.hdgl"
+/* Strand count — configurable at open time.  Must be a power of 2. */
+#define ZCHG_STORE_STRAND_COUNT_DEFAULT 8
+#define ZCHG_STORE_STRAND_COUNT_MAX     256
 
-/* In-memory index capacity (must be power of 2) */
-#define ZCHG_STORE_INDEX_CAP        4096
+/* In-memory index — grows automatically; these are defaults / ceiling. */
+#define ZCHG_STORE_INDEX_CAP_DEFAULT    4096
+#define ZCHG_STORE_INDEX_CAP_MAX        (1u << 24)   /* 16 M slots */
+
+/* Rehash when occupied slots exceed this percentage of capacity. */
+#define ZCHG_STORE_LOAD_FACTOR_REHASH   75
 
 /* EMA alpha — mirrors zchg_lattice.c ZCHG_EMA_ALPHA */
-#define ZCHG_STORE_EMA_ALPHA        0.3
+#define ZCHG_STORE_EMA_ALPHA            0.3
 
 /* Max record_type length (excluding null) */
-#define ZCHG_STORE_TYPE_MAX         31
+#define ZCHG_STORE_TYPE_MAX             31
 
 /* lattice_ref is a 16-char hex phi_addr + null */
-#define ZCHG_STORE_REF_LEN          17
+#define ZCHG_STORE_REF_LEN              17
+
+/* Return codes */
+#define ZCHG_OK                 0
+#define ZCHG_ERR                (-1)
+#define ZCHG_ERR_WRONG_SHARD    (-2)    /* key belongs to a different shard */
+#define ZCHG_ERR_INDEX_OOM      (-3)    /* index rehash failed (OOM) */
 
 /* ============================================================================
  * Record (in-memory representation of the latest frame for a phi_addr)
  * ============================================================================ */
 
 typedef struct zchg_store_record {
-    uint64_t    phi_addr;                       /* Geometric address (phi-tau hash) */
-    uint8_t     strand_id;                      /* Strand (0-7) */
+    uint64_t    phi_addr;                        /* Geometric address (phi-tau hash) */
+    uint32_t    strand_id;                       /* Strand (0 .. strand_count-1) */
     char        record_type[ZCHG_STORE_TYPE_MAX + 1];
-    char        lattice_ref[ZCHG_STORE_REF_LEN];/* Parent phi_addr hex, or "" */
-    double      authority_w;                    /* EMA authority signal [0.0, 1.0] */
-    char       *payload;                        /* Heap-allocated JSON payload */
+    char        lattice_ref[ZCHG_STORE_REF_LEN]; /* Parent phi_addr hex, or "" */
+    double      authority_w;                     /* EMA authority signal [0.0, 1.0] */
+    char       *payload;                         /* Heap-allocated JSON payload */
     size_t      payload_len;
-    uint64_t    last_ts;                        /* Milliseconds since epoch */
-    struct zchg_store_record *_next;            /* Open-addressing chain */
+    uint64_t    last_ts;                         /* Milliseconds since epoch */
+    struct zchg_store_record *_next;             /* Reserved (open-addressing) */
 } zchg_store_record_t;
 
 /* ============================================================================
@@ -106,7 +112,7 @@ typedef struct zchg_store_record {
  * ============================================================================ */
 
 typedef struct {
-    uint8_t     strand_id;
+    uint32_t    strand_id;
     char        strand_name[32];
     double      authority_w;        /* EMA of write activity on this strand */
     uint64_t    record_count;       /* Unique phi_addrs in this strand */
@@ -114,18 +120,35 @@ typedef struct {
 } zchg_strand_signal_t;
 
 /* ============================================================================
- * Store
+ * Store  (v0.2 — all fixed arrays replaced with heap-allocated pointers)
  * ============================================================================ */
 
 typedef struct {
     char                    store_dir[512];
-    int                     strand_fd[8];               /* open(O_RDWR|O_CREAT|O_APPEND) */
-    zchg_store_record_t    *index[ZCHG_STORE_INDEX_CAP];/* phi_addr hash table */
-    zchg_strand_signal_t    strands[8];
+
+    /* Strand file descriptors — heap-allocated, strand_count entries */
+    int                    *strand_fd;
+
+    /* In-memory lattice index — heap-allocated, index_cap entries, grows */
+    zchg_store_record_t   **index;
+    uint32_t                index_cap;      /* current capacity (power of 2) */
+    uint32_t                index_used;     /* occupied slots */
+
+    /* Per-strand signals — heap-allocated, strand_count entries */
+    zchg_strand_signal_t   *strands;
+
+    /* Scaling parameters */
+    uint32_t                strand_count;   /* 8, 16, 32 … 256 (power of 2) */
+    uint32_t                shard_id;       /* 0-based shard index for this node */
+    uint32_t                shard_count;    /* 1 = no sharding */
+
     const char             *cluster_secret;
     size_t                  secret_len;
     uint64_t                total_puts;
     uint64_t                total_gets;
+
+    /* Internal write-coalescing buffers (opaque to callers) */
+    void                   *_wbuf;          /* _strand_wbuf_t[], strand_count */
 } zchg_store_t;
 
 /* ============================================================================
@@ -133,8 +156,8 @@ typedef struct {
  * ============================================================================ */
 
 /*
- * zchg_store_open — initialise store, create strand dirs, boot-scan existing
- *                   strand files to rebuild in-memory lattice index.
+ * zchg_store_open — v0.1-compatible open. Defaults: 8 strands, 4096-slot
+ *                   index, no sharding.  Calls zchg_store_open_ex internally.
  * Returns 0 on success, -1 on error.
  */
 int  zchg_store_open(zchg_store_t *store,
@@ -143,28 +166,41 @@ int  zchg_store_open(zchg_store_t *store,
                      size_t        secret_len);
 
 /*
- * zchg_store_close — flush and close all strand file descriptors, free index.
+ * zchg_store_open_ex — full v0.2 open.
+ *
+ *   strand_count   : number of strand files to create/open (0 = default 8).
+ *                    Must be a power of 2, max 256.
+ *   index_cap_hint : initial in-memory index capacity (0 = default 4096).
+ *                    Must be a power of 2.  Grows automatically.
+ *   shard_id       : 0-based index of this node's shard.
+ *   shard_count    : total number of shards (1 = no sharding / accept all).
+ *
+ * Shard routing: zchg_store_put() returns ZCHG_ERR_WRONG_SHARD (-2) for
+ * keys that hash to a different shard.  Use zchg_store_shard_of() to
+ * pre-check before calling put.
+ */
+int  zchg_store_open_ex(zchg_store_t *store,
+                         const char   *store_dir,
+                         const char   *cluster_secret,
+                         size_t        secret_len,
+                         uint32_t      strand_count,
+                         uint32_t      index_cap_hint,
+                         uint32_t      shard_id,
+                         uint32_t      shard_count);
+
+/*
+ * zchg_store_close — flush write buffers, close strand fds, free all memory.
  */
 void zchg_store_close(zchg_store_t *store);
 
 /*
- * zchg_store_flush — flush the coalescing write buffer for all 8 strands to
- * disk immediately.  Called automatically by zchg_store_close().  The HTTP
- * handler calls this after each PUT response so single-request durability is
- * preserved.  Raise WBUF_FLUSH_COUNT in zchg_store.c to batch N frames per
- * flush for higher write throughput at the cost of a small durability window.
+ * zchg_store_flush — flush coalescing write buffer for all strands to disk.
  */
 int  zchg_store_flush(zchg_store_t *store);
 
 /*
  * zchg_store_put — write a record into the lattice.
- *   key         : logical identifier (e.g. "session:abc123")
- *   record_type : category tag (e.g. "session", "player", "home")
- *   lattice_ref : parent phi_addr as 16-char hex string, or NULL
- *   payload     : raw JSON bytes
- *   payload_len : length of payload
- * The phi-tau address and strand are computed from key.
- * Returns 0 on success.
+ * Returns ZCHG_OK (0), ZCHG_ERR (-1), or ZCHG_ERR_WRONG_SHARD (-2).
  */
 int  zchg_store_put(zchg_store_t *store,
                     const char   *key,
@@ -180,13 +216,12 @@ int  zchg_store_put(zchg_store_t *store,
 zchg_store_record_t* zchg_store_get(zchg_store_t *store, const char *key);
 
 /*
- * zchg_store_get_by_addr — lookup by phi_addr directly (hex string or uint64).
+ * zchg_store_get_by_addr — lookup by phi_addr directly.
  */
 zchg_store_record_t* zchg_store_get_by_addr(zchg_store_t *store, uint64_t phi_addr);
 
 /*
  * zchg_store_scan — iterate every live record in the lattice index.
- * Callback receives each record and user data pointer.
  */
 int  zchg_store_scan(zchg_store_t *store,
                      void (*cb)(zchg_store_record_t *rec, void *user),
@@ -201,8 +236,7 @@ int  zchg_store_scan_type(zchg_store_t *store,
                            void *user);
 
 /*
- * zchg_store_scan_ref — iterate records whose lattice_ref matches a phi_addr.
- * Used to load children of a parent record.
+ * zchg_store_scan_ref — iterate records whose lattice_ref matches parent.
  */
 int  zchg_store_scan_ref(zchg_store_t *store,
                           uint64_t      parent_phi_addr,
@@ -211,14 +245,31 @@ int  zchg_store_scan_ref(zchg_store_t *store,
 
 /*
  * zchg_store_strand_signals — fill out[8] with per-strand EMA signals.
+ * For backward compat: if strand_count < 8 the remaining slots are zeroed;
+ * if strand_count > 8 only the first 8 entries are returned.
+ * Use zchg_store_strand_signals_n to get all strand_count entries.
  */
 void zchg_store_strand_signals(zchg_store_t *store, zchg_strand_signal_t out[8]);
 
 /*
+ * zchg_store_strand_signals_n — fill out[] with all strand_count entries.
+ * *out_count is set to the number of entries written.
+ * out must have room for at least store->strand_count entries.
+ */
+int  zchg_store_strand_signals_n(zchg_store_t        *store,
+                                  zchg_strand_signal_t *out,
+                                  uint32_t             *out_count);
+
+/*
  * zchg_store_phi_addr — compute phi-tau address for a logical key.
- * Useful for building lattice_ref values without calling put.
  */
 uint64_t zchg_store_phi_addr(const char *key);
+
+/*
+ * zchg_store_shard_of — compute which shard owns a key.
+ * Returns a value in [0, shard_count).  Use before put() to route keys.
+ */
+uint32_t zchg_store_shard_of(const char *key, uint32_t shard_count);
 
 #ifdef __cplusplus
 }

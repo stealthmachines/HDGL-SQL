@@ -158,6 +158,8 @@ int main(int argc, char **argv) {
     }
 
     zchg_store_flush(&store);
+    uint32_t final_index_cap  = store.index_cap;
+    uint32_t final_index_used = store.index_used;
     zchg_store_close(&store);
     rmdir_store();
 
@@ -165,7 +167,8 @@ int main(int argc, char **argv) {
     printf("  All numbers are direct C API calls — zero network/HTTP overhead.\n");
     printf("  PUT bounded by HMAC-SHA256 per frame + disk append (O_WRONLY|O_APPEND).\n");
     printf("  GET bounded by in-memory open-address Fibonacci hash lookup only.\n");
-    printf("  SCAN bounded by index capacity (%d slots).\n", ZCHG_STORE_INDEX_CAP);
+    printf("  SCAN bounded by index capacity (%u slots, %u used, grows on demand).\n",
+           final_index_cap, final_index_used);
     printf("  Single-threaded (library has no internal locking).\n");
 
     return 0;
