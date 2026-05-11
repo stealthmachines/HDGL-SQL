@@ -38,8 +38,10 @@ BENCH_SQLITE_SRC = bench_sqlite.c
 BENCH_SQLITE_BIN = bench_sqlite
 MIGRATE_SRC      = hdgl_from_sqlite.c
 MIGRATE_BIN      = hdgl_from_sqlite
+MIGRATE_BACK_SRC = hdgl_to_sqlite.c
+MIGRATE_BACK_BIN = hdgl_to_sqlite
 
-.PHONY: all shared test bench bench-sqlite migrate clean help
+.PHONY: all shared test bench bench-sqlite migrate migrate-back clean help
 
 all: $(OBJDIR) $(LIB_STATIC)
 	@echo "Built: $(LIB_STATIC)"
@@ -87,7 +89,7 @@ $(TEST_SRC):
 
 clean:
 	@rm -rf $(OBJDIR) $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN) $(TEST_SRC) \
-	        $(BENCH_BIN) $(BENCH_SQLITE_BIN) $(MIGRATE_BIN)
+	        $(BENCH_BIN) $(BENCH_SQLITE_BIN) $(MIGRATE_BIN) $(MIGRATE_BACK_BIN)
 	@echo "Cleaned"
 
 # ============================================================================
@@ -116,7 +118,17 @@ migrate: all $(MIGRATE_SRC)
 	$(CC) $(CFLAGS) -I$(INCDIR) -o $(MIGRATE_BIN) $(MIGRATE_SRC) \
 	    $(LIB_STATIC) $(LDFLAGS) -lsqlite3
 	@echo "Built: $(MIGRATE_BIN)"
-	@echo "Usage: ./$(MIGRATE_BIN) <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret]"
+	@echo "Usage: ./$(MIGRATE_BIN) <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret] [strand_count]"
+
+# ============================================================================
+# Reverse migration — export HDGL-SQL store back to SQLite
+# ============================================================================
+
+migrate-back: all $(MIGRATE_BACK_SRC)
+	$(CC) $(CFLAGS) -I$(INCDIR) -o $(MIGRATE_BACK_BIN) $(MIGRATE_BACK_SRC) \
+	    $(LIB_STATIC) $(LDFLAGS) -lsqlite3
+	@echo "Built: $(MIGRATE_BACK_BIN)"
+	@echo "Usage: ./$(MIGRATE_BACK_BIN) <hdgl_store_dir> <sqlite_path> [table] [secret] [strand_count]"
 
 # ============================================================================
 # Help
@@ -131,7 +143,8 @@ help:
 	@echo "  make test          Build + run smoke test (open/put/get/close)"
 	@echo "  make bench         Build + run HDGL-SQL throughput benchmark (direct C API)"
 	@echo "  make bench-sqlite  Build + run SQLite C API benchmark (WAL, apples-to-apples)"
-	@echo "  make migrate       Build hdgl_from_sqlite migration tool"
+	@echo "  make migrate       Build hdgl_from_sqlite  (SQLite -> HDGL-SQL)"
+	@echo "  make migrate-back  Build hdgl_to_sqlite    (HDGL-SQL -> SQLite)"
 	@echo "  make clean         Remove build artifacts"
 	@echo ""
 	@echo "Integration:"

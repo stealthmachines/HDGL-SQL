@@ -8,17 +8,26 @@
  * is the logical key; the rest of the row is serialized as JSON payload. The
  * phi-tau hash of the key column determines the strand automatically.
  *
+ * Lossless guarantees:
+ *   - NULL, INTEGER, FLOAT, TEXT columns are represented exactly in JSON.
+ *   - BLOB columns are hex-encoded as "\\x<hexdata>" strings — no null-byte
+ *     truncation.  hdgl_to_sqlite decodes these back to raw BLOBs.
+ *   - Rows larger than MAX_PAYLOAD bytes are skipped and counted.
+ *   - v0.2 stores: index grows dynamically (up to 16M unique keys). v0.1
+ *     stores have a fixed 4096-key index; rows beyond that are skipped.
+ *
  * Usage:
- *   ./hdgl_from_sqlite <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret]
+ *   ./hdgl_from_sqlite <sqlite_path> <table> <key_col> <hdgl_store_dir> \
+ *                      [secret] [strand_count]
  *
  * Example:
- *   ./hdgl_from_sqlite frontierland_mega.hdgl hdgl_lattice phi_addr ./hdgl_store mykey
+ *   ./hdgl_from_sqlite frontierland_mega.hdgl hdgl_lattice phi_addr ./hdgl_store mykey 8
  *
  *   Migrates all rows from hdgl_lattice table, using phi_addr column as the
  *   logical key, into the HDGL-SQL binary strand store at ./hdgl_store.
+ *   strand_count defaults to 8 (v0.1-compatible).
  *
  * Notes:
- *   - All column values are serialized as JSON strings in the payload field.
  *   - record_type is set to the table name unless a 'record_type' column exists.
  *   - lattice_ref is set from a 'lattice_ref' column if present, else empty.
  *   - Existing HDGL-SQL store data is preserved (appends only).
@@ -70,8 +79,25 @@ static int build_json(sqlite3_stmt *stmt, int ncols, char *buf, size_t bufsz) {
         } else if (type == SQLITE_FLOAT) {
             double v = sqlite3_column_double(stmt, i);
             pos += (size_t)snprintf(buf + pos, bufsz - pos, "%.17g", v);
+        } else if (type == SQLITE_BLOB) {
+            /* Binary BLOB — encode as JSON string "\\x<hexbytes>" to preserve
+             * null bytes and non-UTF-8 data losslessly.  hdgl_to_sqlite
+             * restores these via sqlite3_bind_blob after hex-decoding. */
+            static const char HEX[] = "0123456789abcdef";
+            const unsigned char *blob = (const unsigned char *)sqlite3_column_blob(stmt, i);
+            int blen = sqlite3_column_bytes(stmt, i);
+            /* prefix "\\x" (2 chars) + 2 hex chars per byte + 2 quotes + NUL */
+            if (pos + 4 + (size_t)(blen * 2) >= bufsz) return -1;
+            buf[pos++] = '"';
+            buf[pos++] = '\\'; buf[pos++] = 'x';
+            for (int j = 0; j < blen && pos + 2 < bufsz; j++) {
+                buf[pos++] = HEX[blob[j] >> 4];
+                buf[pos++] = HEX[blob[j] & 0xf];
+            }
+            if (pos + 1 >= bufsz) return -1;
+            buf[pos++] = '"';
         } else {
-            /* TEXT or BLOB — emit as JSON string with escaping */
+            /* TEXT — emit as JSON string with standard JSON escaping */
             const char *s = (const char *)sqlite3_column_text(stmt, i);
             if (!s) s = "";
             if (pos + 2 >= bufsz) return -1;
@@ -109,28 +135,32 @@ static int find_col(sqlite3_stmt *stmt, int ncols, const char *name) {
 int main(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr,
-            "Usage: %s <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret]\n\n"
+            "Usage: %s <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret] [strand_count]\n\n"
             "  sqlite_path    — path to SQLite database file\n"
             "  table          — table name to migrate\n"
             "  key_col        — column whose value is used as the HDGL-SQL record key\n"
             "  hdgl_store_dir — output directory for HDGL-SQL binary strand files\n"
-            "  secret         — HMAC signing secret (default: hdgl-migrate-secret)\n\n"
+            "  secret         — HMAC signing secret (default: hdgl-migrate-secret)\n"
+            "  strand_count   — number of strand files (default: 8, max: 256, must be power of 2)\n\n"
             "Example:\n"
-            "  %s frontierland_mega.hdgl hdgl_lattice phi_addr ./hdgl_store mykey\n",
+            "  %s frontierland_mega.hdgl hdgl_lattice phi_addr ./hdgl_store mykey 8\n",
             argv[0], argv[0]);
         return 1;
     }
 
-    const char *sqlite_path = argv[1];
-    const char *table       = argv[2];
-    const char *key_col     = argv[3];
-    const char *store_dir   = argv[4];
-    const char *secret      = (argc >= 6) ? argv[5] : DEFAULT_SECRET;
+    const char *sqlite_path  = argv[1];
+    const char *table        = argv[2];
+    const char *key_col      = argv[3];
+    const char *store_dir    = argv[4];
+    const char *secret       = (argc >= 6) ? argv[5] : DEFAULT_SECRET;
+    uint32_t    strand_count = (argc >= 7) ? (uint32_t)atoi(argv[6]) : 0; /* 0 → default 8 */
 
     printf("HDGL-SQL Migration Tool\n");
     printf("  Source:  %s (table: %s, key: %s)\n", sqlite_path, table, key_col);
     printf("  Dest:    %s\n", store_dir);
-    printf("  Secret:  %s\n\n", (argc >= 6) ? "(provided)" : DEFAULT_SECRET);
+    printf("  Secret:  %s\n", (argc >= 6) ? "(provided)" : DEFAULT_SECRET);
+    if (strand_count) printf("  Strands: %u\n", strand_count);
+    printf("\n");
 
     /* Open SQLite source */
     sqlite3 *db;
@@ -152,9 +182,11 @@ int main(int argc, char **argv) {
     }
     printf("Rows to migrate: %lld\n\n", (long long)total_rows);
 
-    /* Open HDGL-SQL store */
+    /* Open HDGL-SQL store — use open_ex so strand_count is respected.
+     * index_cap_hint=0 means use default (4096 on v0.1; grows dynamically on v0.2). */
     zchg_store_t store;
-    if (zchg_store_open(&store, store_dir, secret, strlen(secret)) != 0) {
+    if (zchg_store_open_ex(&store, store_dir, secret, strlen(secret),
+                           strand_count, 0, 0, 1) != 0) {
         fprintf(stderr, "Cannot open HDGL-SQL store at %s\n", store_dir);
         sqlite3_close(db);
         return 1;
@@ -235,15 +267,20 @@ int main(int argc, char **argv) {
 
     zchg_store_flush(&store);
 
-    /* Print strand distribution */
-    zchg_strand_signal_t sigs[8];
-    zchg_store_strand_signals(&store, sigs);
-    printf("\nStrand distribution after migration:\n");
-    for (int i = 0; i < 8; i++) {
-        printf("  %s: %llu records  authority_w=%.3f\n",
-               sigs[i].strand_name,
-               (unsigned long long)sigs[i].record_count,
-               sigs[i].authority_w);
+    /* Print strand distribution (works for any strand count) */
+    uint32_t nstrands = store.strand_count;
+    zchg_strand_signal_t *sigs = malloc(nstrands * sizeof(*sigs));
+    if (sigs) {
+        uint32_t filled = nstrands;
+        zchg_store_strand_signals_n(&store, sigs, &filled);
+        printf("\nStrand distribution after migration:\n");
+        for (uint32_t i = 0; i < filled; i++) {
+            printf("  %s: %llu records  authority_w=%.3f\n",
+                   sigs[i].strand_name,
+                   (unsigned long long)sigs[i].record_count,
+                   sigs[i].authority_w);
+        }
+        free(sigs);
     }
 
     zchg_store_close(&store);
