@@ -1,19 +1,25 @@
 # HDGL-SQL v1
 
-HDGL-SQL is a strand-native persistent store implementation extracted from ZCHG.
-It is not a SQL-table engine and it does not model data as rows and indexes.
+HDGL-SQL is a strand-native persistent store — a fundamentally different storage model from relational databases.
 
-It stores signed binary frames in 8 geometric strands, with deterministic key routing by phi-tau hash.
+It stores HMAC-signed binary frames in 8 geometric strand files, with deterministic key routing by phi-tau hash and EMA-based analog authority signaling.
+
+## SQLite Compatibility
+
+HDGL-SQL is **not** compatible with SQLite. It does not implement the SQLite C API, does not use the SQLite file format, and has no concept of tables, rows, or SQL query syntax. The name "HDGL-SQL" uses "SQL" as an analogy for structured, queryable storage — not as a compatibility claim. If you need a drop-in SQLite replacement you are looking for the wrong library.
+
+HDGL-SQL exists in a different category: no schema, no rows, no integer primary keys. Records are addressed by phi-tau geometric hash, stored in append-only strand logs, and queried by key, type, or lattice ancestry.
 
 ## What This Repository Is
 
-This repository is the canonical HDGL-SQL store and lattice source set:
+This repository is the canonical HDGL-SQL source set (6 files):
 
-- include/zchg_core.h
-- include/zchg_lattice.h
-- include/zchg_store.h
-- src/zchg_lattice.c
-- src/zchg_store.c
+- include/zchg_core.h — frame protocol, frame header struct, HMAC declarations
+- include/zchg_lattice.h — phi-spiral routing and EMA API declarations
+- include/zchg_store.h — full store API, record types, strand signal types
+- src/zchg_frame.c — frame serialization, HMAC-SHA256 sign/verify implementation
+- src/zchg_lattice.c — phi-tau hash, strand routing, EMA, provisioner pipeline
+- src/zchg_store.c — strand files, append-only write path, boot-scan, in-memory lattice index
 
 This repository intentionally does not include the daemon, HTTP front door, benchmark tools, or application runtime.
 
@@ -99,16 +105,17 @@ Primary API from `include/zchg_store.h`:
 This repository is a source module set, not a complete standalone executable.
 
 1. Add `include/` to your compiler include paths.
-2. Compile and link `src/zchg_lattice.c` and `src/zchg_store.c` into your host app.
-3. Ensure your build links OpenSSL crypto (HMAC functions used by the frame signing path).
+2. Compile `src/zchg_frame.c`, `src/zchg_lattice.c`, and `src/zchg_store.c` and link them into your host app.
+3. Link against OpenSSL (`-lcrypto`) and math (`-lm`). HMAC-SHA256 frame signing requires OpenSSL.
 4. Provide a persistent directory path for the store (for example `./hdgl_store`).
 
-Example compile line (Linux style):
+Example compile line (Linux/macOS):
 
 ```bash
+cc -O3 -Iinclude -c src/zchg_frame.c   -o zchg_frame.o
 cc -O3 -Iinclude -c src/zchg_lattice.c -o zchg_lattice.o
-cc -O3 -Iinclude -c src/zchg_store.c -o zchg_store.o
-cc -O3 -Iinclude your_app.c zchg_lattice.o zchg_store.o -lcrypto -lm -o your_app
+cc -O3 -Iinclude -c src/zchg_store.c   -o zchg_store.o
+cc -O3 -Iinclude your_app.c zchg_frame.o zchg_lattice.o zchg_store.o -lcrypto -lm -o your_app
 ```
 
 ## Minimal Usage Example
@@ -154,11 +161,24 @@ int main(void) {
 
 ## Operational Notes
 
-- Append-only semantics preserve history naturally.
-- In-memory index capacity is fixed at 4096 live phi addresses (`ZCHG_STORE_INDEX_CAP`).
-- `WBUF_FLUSH_COUNT` in `src/zchg_store.c` controls write buffering behavior.
-	Current default is 1 (writev path with immediate flush behavior).
+- Append-only semantics preserve history naturally. Records are never overwritten in-place.
+- In-memory index capacity is fixed at 4096 live phi addresses (`ZCHG_STORE_INDEX_CAP` in `zchg_store.h`). Exceeding this causes inserts to fail silently. Raise the constant and recompile for larger working sets.
+- `WBUF_FLUSH_COUNT` in `src/zchg_store.c` controls write batching. Default is 1 (every frame flushed via `writev` immediately). Raise to N to coalesce N frames per flush for higher write throughput at the cost of up to N frames of durability window.
 - Single-threaded access assumptions apply unless your host app adds external synchronization.
+- Boot-scan time is proportional to total frames on disk across all 8 strand files.
+
+## Performance
+
+Numbers measured on an i7-6700T (4 cores / 8 threads, 2.80 GHz) running the full ZCHG daemon with HTTP overhead included. Store-layer throughput in isolation will be higher.
+
+| Operation | Throughput | Notes |
+|-----------|-----------|-------|
+| GET (key lookup) | ~82,000 req/s | O(1) in-memory Fibonacci hash index |
+| PUT (signed append) | ~3,700 req/s | Disk write + HMAC-SHA256 per frame |
+| Strand signal read | ~57,000 req/s | Reads per-strand EMA state |
+| Error rate | 0 | Measured over 10-second run, 200 concurrent |
+
+PUT throughput is bounded by disk I/O and HMAC signing. GET throughput is bounded by the in-memory hash table and is effectively CPU-only. On NVMe storage or with `WBUF_FLUSH_COUNT` > 1 the PUT rate scales significantly higher.
 
 ## Repository Purpose
 
