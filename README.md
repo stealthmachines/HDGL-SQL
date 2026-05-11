@@ -1,8 +1,8 @@
 # HDGL-SQL v1
 
-HDGL-SQL is a strand-native persistent store — a fundamentally different storage model from relational databases.
+HDGL-SQL is an embeddable storage engine — a compiled library (`libhdglsql.a` / `libhdglsql.so`) you link directly into your application, similar in deployment model to SQLite but with a fundamentally different storage architecture.
 
-It stores HMAC-signed binary frames in 8 geometric strand files, with deterministic key routing by phi-tau hash and EMA-based analog authority signaling.
+It stores HMAC-signed binary frames in 8 geometric strand files, with deterministic key routing by phi-tau hash and EMA-based analog authority signaling. No SQL, no tables, no rows — records are addressed by geometric hash and queried by key, type, or lattice ancestry.
 
 ## SQLite Compatibility
 
@@ -12,7 +12,9 @@ HDGL-SQL exists in a different category: no schema, no rows, no integer primary 
 
 ## What This Repository Is
 
-This repository is the canonical HDGL-SQL source set (6 files):
+This repository is the canonical HDGL-SQL storage engine — a self-contained library that builds to `libhdglsql.a` (static) or `libhdglsql.so` (shared) using the included Makefile.
+
+Source files (6):
 
 - include/zchg_core.h — frame protocol, frame header struct, HMAC declarations
 - include/zchg_lattice.h — phi-spiral routing and EMA API declarations
@@ -22,6 +24,26 @@ This repository is the canonical HDGL-SQL source set (6 files):
 - src/zchg_store.c — strand files, append-only write path, boot-scan, in-memory lattice index
 
 This repository intentionally does not include the daemon, HTTP front door, benchmark tools, or application runtime.
+
+## Building
+
+Requires: GCC or Clang, OpenSSL development headers (`libssl-dev` / `openssl-devel`).
+
+```bash
+# Static library (default)
+make
+
+# Shared library
+make shared
+
+# Smoke test (builds static lib + compiles + runs a minimal open/put/get/close)
+make test
+
+# Clean
+make clean
+```
+
+Outputs: `libhdglsql.a` (static) or `libhdglsql.so` (shared) in the repo root.
 
 ## Mental Model
 
@@ -102,14 +124,22 @@ Primary API from `include/zchg_store.h`:
 
 ## How To Integrate
 
-This repository is a source module set, not a complete standalone executable.
+**Option A — link the prebuilt library (recommended):**
+
+```bash
+# In this repo:
+make          # produces libhdglsql.a
+
+# In your project:
+cc -O3 -I/path/to/hdgl-sql/include your_app.c \
+    -L/path/to/hdgl-sql -lhdglsql -lcrypto -lm -o your_app
+```
+
+**Option B — compile sources directly into your build:**
 
 1. Add `include/` to your compiler include paths.
 2. Compile `src/zchg_frame.c`, `src/zchg_lattice.c`, and `src/zchg_store.c` and link them into your host app.
-3. Link against OpenSSL (`-lcrypto`) and math (`-lm`). HMAC-SHA256 frame signing requires OpenSSL.
-4. Provide a persistent directory path for the store (for example `./hdgl_store`).
-
-Example compile line (Linux/macOS):
+3. Link against OpenSSL (`-lcrypto`) and math (`-lm`).
 
 ```bash
 cc -O3 -Iinclude -c src/zchg_frame.c   -o zchg_frame.o
@@ -117,6 +147,8 @@ cc -O3 -Iinclude -c src/zchg_lattice.c -o zchg_lattice.o
 cc -O3 -Iinclude -c src/zchg_store.c   -o zchg_store.o
 cc -O3 -Iinclude your_app.c zchg_frame.o zchg_lattice.o zchg_store.o -lcrypto -lm -o your_app
 ```
+
+Provide a persistent directory path for the store (e.g. `./hdgl_store`).
 
 ## Minimal Usage Example
 
@@ -169,7 +201,9 @@ int main(void) {
 
 ## Performance
 
-Numbers measured on an i7-6700T (4 cores / 8 threads, 2.80 GHz) running the full ZCHG daemon with HTTP overhead included. Store-layer throughput in isolation will be higher.
+Numbers measured on an i7-6700T (4 cores / 8 threads, 2.80 GHz), 200 concurrent connections, 10-second run. HDGL-SQL numbers go through a full HTTP/epoll round-trip (TCP + syscall overhead included). SQLite numbers are Python in-process calls with WAL mode — zero network overhead.
+
+### HDGL-SQL throughput
 
 | Operation | Throughput | Notes |
 |-----------|-----------|-------|
@@ -178,7 +212,20 @@ Numbers measured on an i7-6700T (4 cores / 8 threads, 2.80 GHz) running the full
 | Strand signal read | ~57,000 req/s | Reads per-strand EMA state |
 | Error rate | 0 | Measured over 10-second run, 200 concurrent |
 
-PUT throughput is bounded by disk I/O and HMAC signing. GET throughput is bounded by the in-memory hash table and is effectively CPU-only. On NVMe storage or with `WBUF_FLUSH_COUNT` > 1 the PUT rate scales significantly higher.
+### HDGL-SQL vs SQLite WAL (Python gateway workload)
+
+This comparison was measured against the actual MUD session-store workload that motivated HDGL-SQL. SQLite numbers are Python `sqlite3` module calls (in-process, WAL mode). HDGL-SQL numbers go through the HTTP daemon.
+
+| Operation | SQLite WAL | HDGL-SQL (HTTP) | Delta |
+|-----------|-----------|-----------------|-------|
+| Baseline no-op read | 403,062 req/s | 83,286 req/s | SQLite 4.8x faster† |
+| Write (PUT / upsert) | 10,015 req/s | ~4,000 req/s | SQLite 2.5x faster† |
+| Read by key (GET) | **18 req/s** | **85,421 req/s** | **HDGL 4,826x faster** |
+| Aggregate / scan | **114 req/s** | **56,755 req/s** | **HDGL 499x faster** |
+
+†The phases where SQLite "wins" measure Python in-process calls with zero network overhead. The moment you add HTTP to SQLite (as the old gateway did), those leads vanish. SQLite's read-by-key collapse to 18 req/s is caused by the Python GIL serializing every `SELECT` through a single connection — each keyed read waits behind every other thread.
+
+PUT throughput is bounded by disk I/O and HMAC signing. GET throughput is bounded by the in-memory hash table and is effectively CPU-only. Using HDGL-SQL as a direct library (no HTTP layer) eliminates the network/syscall overhead that narrows the gap with SQLite's no-op baseline. On NVMe storage or with `WBUF_FLUSH_COUNT` > 1 the PUT rate scales significantly higher.
 
 ## Repository Purpose
 
