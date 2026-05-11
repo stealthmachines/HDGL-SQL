@@ -32,10 +32,14 @@ LIB_SHARED  = libhdglsql.so
 # Default: static library
 # ============================================================================
 
-BENCH_SRC   = bench_store.c
-BENCH_BIN   = bench_store
+BENCH_SRC        = bench_store.c
+BENCH_BIN        = bench_store
+BENCH_SQLITE_SRC = bench_sqlite.c
+BENCH_SQLITE_BIN = bench_sqlite
+MIGRATE_SRC      = hdgl_from_sqlite.c
+MIGRATE_BIN      = hdgl_from_sqlite
 
-.PHONY: all shared test bench clean help
+.PHONY: all shared test bench bench-sqlite migrate clean help
 
 all: $(OBJDIR) $(LIB_STATIC)
 	@echo "Built: $(LIB_STATIC)"
@@ -82,7 +86,8 @@ $(TEST_SRC):
 # ============================================================================
 
 clean:
-	@rm -rf $(OBJDIR) $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN) $(TEST_SRC) $(BENCH_BIN)
+	@rm -rf $(OBJDIR) $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN) $(TEST_SRC) \
+	        $(BENCH_BIN) $(BENCH_SQLITE_BIN) $(MIGRATE_BIN)
 	@echo "Cleaned"
 
 # ============================================================================
@@ -91,8 +96,27 @@ clean:
 
 bench: all $(BENCH_SRC)
 	$(CC) $(CFLAGS) -I$(INCDIR) -o $(BENCH_BIN) $(BENCH_SRC) $(LIB_STATIC) $(LDFLAGS)
-	@echo "Running benchmark (5s per phase)..."
+	@echo "Running HDGL-SQL benchmark (5s per phase)..."
 	@./$(BENCH_BIN)
+
+# ============================================================================
+# Benchmark — SQLite C API (WAL, no Python/GIL, apples-to-apples with bench)
+# ============================================================================
+
+bench-sqlite: $(BENCH_SQLITE_SRC)
+	$(CC) $(CFLAGS) -o $(BENCH_SQLITE_BIN) $(BENCH_SQLITE_SRC) -lsqlite3
+	@echo "Running SQLite C API benchmark (5s per phase)..."
+	@./$(BENCH_SQLITE_BIN)
+
+# ============================================================================
+# Migration — import any SQLite table into HDGL-SQL binary strand files
+# ============================================================================
+
+migrate: all $(MIGRATE_SRC)
+	$(CC) $(CFLAGS) -I$(INCDIR) -o $(MIGRATE_BIN) $(MIGRATE_SRC) \
+	    $(LIB_STATIC) $(LDFLAGS) -lsqlite3
+	@echo "Built: $(MIGRATE_BIN)"
+	@echo "Usage: ./$(MIGRATE_BIN) <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret]"
 
 # ============================================================================
 # Help
@@ -104,9 +128,11 @@ help:
 	@echo "Targets:"
 	@echo "  make           Build static library (libhdglsql.a)"
 	@echo "  make shared    Build shared library (libhdglsql.so)"
-	@echo "  make test      Build + run smoke test (open/put/get/close)"
-	@echo "  make bench     Build + run throughput benchmark (direct API, no HTTP)"
-	@echo "  make clean     Remove build artifacts"
+	@echo "  make test          Build + run smoke test (open/put/get/close)"
+	@echo "  make bench         Build + run HDGL-SQL throughput benchmark (direct C API)"
+	@echo "  make bench-sqlite  Build + run SQLite C API benchmark (WAL, apples-to-apples)"
+	@echo "  make migrate       Build hdgl_from_sqlite migration tool"
+	@echo "  make clean         Remove build artifacts"
 	@echo ""
 	@echo "Integration:"
 	@echo "  CFLAGS: -Iinclude"

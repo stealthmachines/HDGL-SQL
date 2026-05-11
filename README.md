@@ -225,20 +225,65 @@ Numbers when HDGL-SQL sits behind the full HTTP/epoll daemon (TCP + syscall over
 | Strand signal read | ~57,000 req/s | HTTP round-trip to EMA state |
 | Error rate | 0 | 10-second run, 200 concurrent connections |
 
-### HDGL-SQL vs SQLite WAL (Python gateway workload)
+### HDGL-SQL vs SQLite C API (WAL) — apples-to-apples
 
-This comparison was measured against the MUD session-store workload that motivated HDGL-SQL. SQLite numbers are Python `sqlite3` module calls (in-process, WAL mode, zero network overhead). HDGL-SQL numbers go through the HTTP daemon.
+Both benchmarks run on the same hardware, same phase duration, direct C API, no Python, no GIL, no HTTP. SQLite 3.37.2, WAL mode, `PRAGMA synchronous=NORMAL`, 64 MB page cache. HDGL-SQL with `WBUF_FLUSH_COUNT=1` (one `write()` per frame, same durability). Run with `make bench-sqlite` vs `make bench`.
 
-| Operation | SQLite WAL | HDGL-SQL (direct lib) | HDGL-SQL (HTTP) |
-|-----------|-----------|----------------------|-----------------|
-| Baseline no-op read | 403,062 req/s | **15,631,031 req/s** | 83,286 req/s |
-| Write (PUT / upsert) | 10,015 req/s | **170,517 req/s** | ~4,000 req/s |
-| Read by key (GET) | **18 req/s** | **15,631,031 req/s** | **85,421 req/s** |
-| Aggregate / scan | **114 req/s** | **32,276,406 req/s** | ~57,000 req/s |
+| Operation | SQLite 3.37.2 (C API, WAL) | HDGL-SQL v1 (C API) | Delta |
+|-----------|---------------------------|---------------------|-------|
+| PUT / INSERT | 267,009 req/s | **171,620 req/s** | SQLite 1.6x faster |
+| GET / SELECT PK | 201,851 req/s | **15,550,133 req/s** | **HDGL 77x faster** |
+| SCAN / SELECT * | 186,750 req/s | **32,879,426 req/s** | **HDGL 176x faster** |
+| Signals / GROUP BY | 114,019 req/s | **27,514,841 req/s** | **HDGL 241x faster** |
 
-SQLite's read-by-key collapses to 18 req/s under concurrent load because the Python GIL serializes every `SELECT` through a single connection — every keyed read waits behind every other thread. The 403K "baseline" is a Python in-process no-op call with zero disk access or contention; the direct library column is a genuine O(1) hash lookup in C.
+PUT is the one phase where SQLite has the edge — its WAL append is cheaper than HMAC-SHA256 per frame. That is the intentional tradeoff for cryptographic strand integrity. Raise `WBUF_FLUSH_COUNT` in `src/zchg_store.c` to coalesce N frames per flush and push PUT past 500K req/s at the cost of a small durability window.
 
-PUT throughput at the library level (170K req/s) exceeds SQLite WAL (10K req/s) because HDGL-SQL uses a pure append with a single `write()` syscall per frame — no B-tree page splits, no WAL checkpointer. The HMAC-SHA256 cost is ~0.2 µs per frame and is the dominant per-write cost. Raise `WBUF_FLUSH_COUNT` in `src/zchg_store.c` to coalesce N frames per flush and push PUT rates past 500K req/s.
+GET is where the architectures diverge: SQLite must descend a B-tree to resolve a primary key. HDGL-SQL resolves a key by a single Fibonacci hash into a flat open-address array — O(1) with no tree traversal. The 77x gap is structural.
+
+### Prior Python-gateway SQLite comparison (for historical context)
+
+The original comparison was measured against the MUD session-store workload. SQLite numbers were Python `sqlite3` under GIL contention — included here because they explain why HDGL-SQL was built.
+
+| Operation | SQLite WAL (Python, GIL) | HDGL-SQL (HTTP daemon) |
+|-----------|--------------------------|------------------------|
+| Baseline no-op read | 403,062 req/s | 83,286 req/s |
+| Write (PUT / upsert) | 10,015 req/s | ~4,000 req/s |
+| Read by key | **18 req/s** | **85,421 req/s** |
+| Aggregate / scan | **114 req/s** | ~57,000 req/s |
+
+SQLite's keyed read collapsed to 18 req/s under concurrent load because the Python GIL serializes every `SELECT` through a single connection. HDGL-SQL's phi-tau index has no locking on reads.
+
+## Migration from SQLite
+
+`hdgl_from_sqlite` imports any SQLite table into HDGL-SQL binary strand files in a single pass. Build it with:
+
+```sh
+make migrate
+```
+
+Usage:
+
+```
+./hdgl_from_sqlite <sqlite_path> <table> <key_col> <hdgl_store_dir> [secret]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `sqlite_path` | Path to the `.db` / `.sqlite3` file |
+| `table` | Table name to read |
+| `key_col` | Column to use as the HDGL-SQL phi-address key |
+| `hdgl_store_dir` | Output directory for the 8 strand binary files |
+| `secret` | Optional HMAC signing secret (default: empty string) |
+
+Every row is serialized to a JSON payload containing all columns, signed with HMAC-SHA256, and appended to the appropriate strand file. If the table has columns named `record_type` or `lattice_ref`, they are used verbatim; otherwise the values default to `"row"` and `""`.
+
+**Example** — import the frontierland state table:
+
+```sh
+./hdgl_from_sqlite frontierland.db hdgl_lattice phi_addr ./hdgl_store mykey
+```
+
+After import, use the standard `zchg_store_get()` / `zchg_store_scan()` API to query. The store is byte-compatible with any other HDGL-SQL producer — migration is destructive only in the sense that the source SQLite file is never written to.
 
 ## Repository Purpose
 
