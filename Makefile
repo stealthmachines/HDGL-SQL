@@ -32,7 +32,10 @@ LIB_SHARED  = libhdglsql.so
 # Default: static library
 # ============================================================================
 
-.PHONY: all shared test clean help
+BENCH_SRC   = bench_store.c
+BENCH_BIN   = bench_store
+
+.PHONY: all shared test bench clean help
 
 all: $(OBJDIR) $(LIB_STATIC)
 	@echo "Built: $(LIB_STATIC)"
@@ -79,8 +82,17 @@ $(TEST_SRC):
 # ============================================================================
 
 clean:
-	@rm -rf $(OBJDIR) $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN) $(TEST_SRC)
+	@rm -rf $(OBJDIR) $(LIB_STATIC) $(LIB_SHARED) $(TEST_BIN) $(TEST_SRC) $(BENCH_BIN)
 	@echo "Cleaned"
+
+# ============================================================================
+# Benchmark — direct library throughput, no HTTP
+# ============================================================================
+
+bench: all $(BENCH_SRC)
+	$(CC) $(CFLAGS) -I$(INCDIR) -o $(BENCH_BIN) $(BENCH_SRC) $(LIB_STATIC) $(LDFLAGS)
+	@echo "Running benchmark (5s per phase)..."
+	@./$(BENCH_BIN)
 
 # ============================================================================
 # Help
@@ -93,6 +105,7 @@ help:
 	@echo "  make           Build static library (libhdglsql.a)"
 	@echo "  make shared    Build shared library (libhdglsql.so)"
 	@echo "  make test      Build + run smoke test (open/put/get/close)"
+	@echo "  make bench     Build + run throughput benchmark (direct API, no HTTP)"
 	@echo "  make clean     Remove build artifacts"
 	@echo ""
 	@echo "Integration:"
